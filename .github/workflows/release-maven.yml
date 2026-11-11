@@ -1,7 +1,12 @@
 name: Release Maven versions
 
-# Runs after the release bot commits a version folder to main (called by publish-on-approval.yml), or
-# when a version folder reaches main another way (push). The Maven repository is served straight from
+# Runs ONLY after a release pull request was approved: publish-on-approval.yml calls it right after
+# the bot commit. It is never started by a push to main — a version folder pushed or merged to main
+# directly gets no tag and no release (and fails a manual run), so nothing is released without an
+# approved pull request. Manual run (workflow_dispatch) is for retries only and applies the same rule:
+# a version is released only when the commit that added its folder is the release bot's
+# ("Published from pull request #N") and the folder matches that pull request's head.
+# The Maven repository is served straight from
 # this repository (raw.githubusercontent.com/<owner>/<repo>/main/maven), so there is nothing to deploy:
 # this workflow re-checks every version folder and maven-metadata.xml, checks that the raw URL serves
 # exactly the bytes in SHA256SUMS, then creates the GitHub Release for every new version (backfilled
@@ -14,11 +19,8 @@ name: Release Maven versions
 # https://raw.githubusercontent.com/<this repository>/main/maven is used.
 
 on:
-  # A manual merge of a version folder (normally the bot publishes them, see publish-on-approval.yml).
-  push:
-    branches: [main]
-    paths:
-      - 'maven/**'
+  # No push trigger on purpose: a direct push or merge to main must not create tags or releases.
+  # Retry of a failed run (same checks; only bot-published versions are released).
   workflow_dispatch:
   # Called by publish-on-approval.yml right after the bot commit (a push made with GITHUB_TOKEN does
   # not start other workflows).
@@ -76,6 +78,32 @@ jobs:
           BASE="${MAVEN_URL:-https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/maven}"; BASE="${BASE%/}"
           python3 -I scripts/maven_site.py pending maven > "$RUNNER_TEMP/versions.jsonl"
           failed=0
+          # approved_pr <dir>: the commit that added <dir>/release.json must be the release bot's commit
+          # from publish-on-approval.yml ("Published from pull request #N", author and committer
+          # github-actions[bot]) and <dir> must be identical to that pull request's head. Sets
+          # APPROVED_PR=N; otherwise prints the reason and returns 1 (the version is not released).
+          approved_pr() {
+            local dir="$1" c who n
+            APPROVED_PR=""
+            c="$(git log --diff-filter=A --format=%H -1 "$TARGET" -- "$dir/release.json")"
+            [ -n "$c" ] || { echo "::error::$dir: no commit on main adds release.json — no release created."; return 1; }
+            who="$(git show -s --format='%an|%cn' "$c")"
+            n="$(git show -s --format=%B "$c" | sed -n 's/^Published from pull request #\([0-9][0-9]*\),.*/\1/p' | head -1)"
+            if [ "$who" != "github-actions[bot]|github-actions[bot]" ] || [ -z "$n" ]; then
+              echo "::error::$dir reached main in ${c:0:7} by ${who%%|*}, not through an approved release pull request (publish-on-approval.yml) — no tag or release created. Remove it from main and open a release PR."
+              return 1
+            fi
+            if [ -n "${PR_NUMBER:-}" ] && [ "$PR_NUMBER" != "$n" ]; then
+              echo "::error::$dir was published from pull request #$n, not #$PR_NUMBER — no release created."
+              return 1
+            fi
+            git fetch --quiet --no-tags origin "+refs/pull/${n}/head:refs/remotes/pr/${n}" \
+              || { echo "::error::$dir: pull request #$n cannot be fetched — no release created."; return 1; }
+            git diff --quiet "$c" "refs/remotes/pr/${n}" -- "$dir" \
+              || { echo "::error::$dir on main differs from pull request #$n — no release created."; return 1; }
+            APPROVED_PR="$n"
+          }
+
           # Folders added by this push (all of them on a manual run): backfilled versions have no
           # release to mark them done, so only the newly added ones are downloaded and checked.
           if [ -n "${BEFORE:-}" ] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
@@ -93,6 +121,9 @@ jobs:
               grep -qxF "$dir" "$RUNNER_TEMP/new-dirs.txt" || continue
             elif gh release view "$tag" >/dev/null 2>&1; then
               continue
+            else
+              # A tag and a release only for versions that came through an approved release PR.
+              approved_pr "$dir" || { failed=1; continue; }
             fi
 
             # The URL customers use must serve exactly the bytes in SHA256SUMS — for every version,
@@ -118,20 +149,12 @@ jobs:
             for extra in "${artifact}-${version}-sources.jar" "${artifact}-${version}.module"; do
               [ -f "$dir/$extra" ] && files+=("$dir/$extra")
             done
-            # Release notes: the '### Release notes' section of the merged pull request that added
+            # Release notes: the '### Release notes' section of the approved pull request that added
             # this folder (badges for fix/feature/improvement/update/change), else RELEASE_NOTES.md.
+            # The bot commit is not linked to the PR by GitHub: the number comes from its message.
             : > "$RUNNER_TEMP/pr-body.md"
-            added="$(git log --diff-filter=A --format=%H -1 -- "$dir/release.json")"
-            if [ -n "${PR_NUMBER:-}" ] && grep -qxF "$dir" "$RUNNER_TEMP/new-dirs.txt"; then
-              # Bot commit: not linked to the PR by GitHub, so the PR number comes from the caller.
-              gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.body // ""' > "$RUNNER_TEMP/pr-body.md" 2>/dev/null \
-                || { echo "::warning::Could not read PR #${PR_NUMBER} — using RELEASE_NOTES.md"; : > "$RUNNER_TEMP/pr-body.md"; }
-            elif [ -n "$added" ]; then
-              gh api "repos/${GITHUB_REPOSITORY}/commits/${added}/pulls" \
-                --jq '[.[] | select(.merged_at != null)][0].body // ""' \
-                > "$RUNNER_TEMP/pr-body.md" 2>/dev/null \
-                || { echo "::warning::No pull request found for $dir — using RELEASE_NOTES.md"; : > "$RUNNER_TEMP/pr-body.md"; }
-            fi
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${APPROVED_PR}" --jq '.body // ""' > "$RUNNER_TEMP/pr-body.md" 2>/dev/null \
+              || { echo "::warning::Could not read PR #${APPROVED_PR} — using RELEASE_NOTES.md"; : > "$RUNNER_TEMP/pr-body.md"; }
             python3 -I scripts/maven_site.py notes "$dir" --pr-body-file "$RUNNER_TEMP/pr-body.md" \
               --maven-url "$BASE" > "$RUNNER_TEMP/notes.md"
             # No --latest for stable versions: GitHub then keeps the highest version as Latest, so a
