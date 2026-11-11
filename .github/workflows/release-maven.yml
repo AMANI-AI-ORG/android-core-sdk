@@ -1,0 +1,118 @@
+name: Release Maven versions
+
+# Runs when a release pull request is merged into main. The Maven repository is served straight from
+# this repository (raw.githubusercontent.com/<owner>/<repo>/main/maven), so there is nothing to deploy:
+# this workflow re-checks every version folder and maven-metadata.xml, checks that the raw URL serves
+# exactly the bytes in SHA256SUMS, then creates the GitHub Release for every new version (backfilled
+# versions get none). Re-running it is safe: existing releases are skipped.
+#
+# Release notes come from the '### Release notes' section of the pull request that added the version
+# folder (scripts/maven_site.py notes); without it, the folder's RELEASE_NOTES.md is used.
+#
+# Repository variable PUBLIC_MAVEN_URL = the URL customers use. When it is empty,
+# https://raw.githubusercontent.com/<this repository>/main/maven is used.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'maven/**'
+  workflow_dispatch:
+
+concurrency:
+  group: release-maven
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the commit that added a version folder leads to its pull request.
+          fetch-depth: 0
+
+      - name: Verify every version folder and maven-metadata.xml
+        run: |
+          set -euo pipefail
+          python3 -I scripts/maven_site.py verify maven
+          python3 -I scripts/maven_site.py check-metadata maven
+
+      - name: Check served files and create missing releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAVEN_URL: ${{ vars.PUBLIC_MAVEN_URL }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          BASE="${MAVEN_URL:-https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/maven}"; BASE="${BASE%/}"
+          python3 -I scripts/maven_site.py pending maven > "$RUNNER_TEMP/versions.jsonl"
+          failed=0
+          # Folders added by this push (all of them on a manual run): backfilled versions have no
+          # release to mark them done, so only the newly added ones are downloaded and checked.
+          if [ -n "${BEFORE:-}" ] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            git diff --name-only --diff-filter=A "$BEFORE" "$GITHUB_SHA" -- maven \
+              | sed -n 's#/release\.json$##p' > "$RUNNER_TEMP/new-dirs.txt"
+          else
+            python3 -I scripts/maven_site.py pending maven | jq -r .dir > "$RUNNER_TEMP/new-dirs.txt"
+          fi
+
+          while read -r line; do
+            dir="$(jq -r .dir <<<"$line")";        tag="$(jq -r .tag <<<"$line")"
+            version="$(jq -r .version <<<"$line")"; artifact="$(jq -r .artifactId <<<"$line")"
+            pre="$(jq -r .prerelease <<<"$line")";  backfilled="$(jq -r .backfilled <<<"$line")"
+            if [ "$backfilled" = "true" ]; then
+              grep -qxF "$dir" "$RUNNER_TEMP/new-dirs.txt" || continue
+            elif gh release view "$tag" >/dev/null 2>&1; then
+              continue
+            fi
+
+            # The URL customers use must serve exactly the bytes in SHA256SUMS — for every version,
+            # backfilled ones included. raw.githubusercontent.com caches for a few minutes.
+            aar="${artifact}-${version}.aar"
+            expected="$(awk -v f="$aar" '$2==f || $2=="*"f {print $1}' "$dir/SHA256SUMS")"
+            url="${BASE}/${dir#maven/}/${aar}"
+            ok=0
+            for i in $(seq 1 20); do
+              if curl -fsSL -o "$RUNNER_TEMP/served.aar" "$url" \
+                 && [ "$(sha256sum "$RUNNER_TEMP/served.aar" | cut -d' ' -f1)" = "$expected" ]; then
+                ok=1; break
+              fi
+              echo "Waiting for $url ($i/20)…"; sleep 30
+            done
+            if [ "$ok" != 1 ]; then
+              echo "::error::$url is not served with SHA-256 $expected after 10 minutes. No release created for $tag."
+              failed=1; continue   # the other versions still get their release; the job fails at the end
+            fi
+            [ "$backfilled" = "true" ] && continue   # backfilled: served and checked, no tag or release
+
+            files=("$dir/$aar" "$dir/${artifact}-${version}.pom" "$dir/SHA256SUMS")
+            for extra in "${artifact}-${version}-sources.jar" "${artifact}-${version}.module"; do
+              [ -f "$dir/$extra" ] && files+=("$dir/$extra")
+            done
+            # Release notes: the '### Release notes' section of the merged pull request that added
+            # this folder (badges for fix/feature/improvement/update/change), else RELEASE_NOTES.md.
+            : > "$RUNNER_TEMP/pr-body.md"
+            added="$(git log --diff-filter=A --format=%H -1 -- "$dir/release.json")"
+            if [ -n "$added" ]; then
+              gh api "repos/${GITHUB_REPOSITORY}/commits/${added}/pulls" \
+                --jq '[.[] | select(.merged_at != null)][0].body // ""' \
+                > "$RUNNER_TEMP/pr-body.md" 2>/dev/null \
+                || { echo "::warning::No pull request found for $dir — using RELEASE_NOTES.md"; : > "$RUNNER_TEMP/pr-body.md"; }
+            fi
+            python3 -I scripts/maven_site.py notes "$dir" --pr-body-file "$RUNNER_TEMP/pr-body.md" \
+              --maven-url "$BASE" > "$RUNNER_TEMP/notes.md"
+            # No --latest for stable versions: GitHub then keeps the highest version as Latest, so a
+            # hotfix on an older line does not take it over.
+            flags=(--target "$GITHUB_SHA" --title "$tag" --notes-file "$RUNNER_TEMP/notes.md")
+            if [ "$pre" = "true" ]; then flags+=(--prerelease --latest=false); fi
+            gh release create "$tag" "${files[@]}" "${flags[@]}"
+            echo "Released $tag — $url" >> "$GITHUB_STEP_SUMMARY"
+          done < "$RUNNER_TEMP/versions.jsonl"
+          exit "$failed"
