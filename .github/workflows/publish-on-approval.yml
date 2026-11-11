@@ -1,0 +1,139 @@
+name: Publish approved release PR
+
+# Release pull requests are NOT merged. When a maintainer approves one:
+#   1. verify   — the same checks as "Verify publish PR" (reusable workflow), on the approved head;
+#   2. publish  — the approval must be for the PR's latest commit and from someone other than its
+#                 author; the version folder(s) are copied from the PR onto main, maven-metadata.xml is
+#                 regenerated and re-checked, and ONE commit "chore(release): …" is pushed to main as
+#                 github-actions[bot]; the PR is closed with a link to that commit;
+#   3. release  — release-maven.yml checks the served AAR and creates the GitHub Release (tag on the
+#                 bot commit, notes from the PR's "### Release notes").
+#
+# Pull requests that change anything outside maven/ are left alone (merge them normally).
+# Requirement: the main ruleset must let GitHub Actions push to main (bypass list). Then everyone who
+# can push a branch here can, through a workflow, write to main — keep write access to maintainers.
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-main
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: >-
+      github.event.review.state == 'approved' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/verify-publish-pr.yml
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      published: ${{ steps.apply.outputs.published }}
+      sha: ${{ steps.apply.outputs.sha }}
+      before: ${{ steps.apply.outputs.before }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Approval is for the latest commit, by someone else
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_SHA: ${{ github.event.review.commit_id }}
+          REVIEWER: ${{ github.event.review.user.login }}
+        run: |
+          set -euo pipefail
+          read -r state head author < <(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"\(.state) \(.head.sha) \(.user.login)"')
+          [ "$state" = "open" ] || { echo "::error::PR #${PR_NUMBER} is ${state}."; exit 1; }
+          [ "$head" = "$REVIEW_SHA" ] || { echo "::error::The approval is for ${REVIEW_SHA}, the PR head is ${head}. Approve the latest commit."; exit 1; }
+          [ "$REVIEWER" != "$author" ] || { echo "::error::A release PR must be approved by someone other than its author."; exit 1; }
+
+      - name: Commit the version folder(s) to main as github-actions[bot]
+        id: apply
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.review.commit_id }}
+          REVIEWER: ${{ github.event.review.user.login }}
+        run: |
+          set -euo pipefail
+          echo "published=false" >> "$GITHUB_OUTPUT"
+          git fetch --quiet --no-tags origin main "+refs/pull/${PR_NUMBER}/head:refs/remotes/pr/head"
+          [ "$(git rev-parse refs/remotes/pr/head)" = "$HEAD_SHA" ] \
+            || { echo "::error::PR head moved after the approval — approve again."; exit 1; }
+          git checkout --quiet -B main origin/main
+
+          # Only maven/ changes are published by the bot: new version folders (A) and the artifact's
+          # maven-metadata.xml (+ checksums, A or M). Anything else → leave the PR to a normal merge.
+          paths=()
+          while IFS= read -r -d '' status && IFS= read -r -d '' path; do
+            case "$path" in
+              maven/*) ;;
+              *) echo "::notice::PR #${PR_NUMBER} changes $path (outside maven/) — not a release PR, nothing published."; exit 0 ;;
+            esac
+            case "$status" in A|M) paths+=("$path") ;; *) echo "::error::$status $path — published files never change."; exit 1 ;; esac
+          done < <(git diff -z --name-status --no-renames "origin/main...${HEAD_SHA}")
+          [ "${#paths[@]}" -gt 0 ] || { echo "::notice::No maven/ changes — nothing to publish."; exit 0; }
+
+          git checkout "$HEAD_SHA" -- "${paths[@]}"
+          # Metadata from main's script over main + the new folders (main may have moved since the PR).
+          python3 -I scripts/maven_site.py metadata maven >/dev/null
+          python3 -I scripts/maven_site.py verify maven
+          python3 -I scripts/maven_site.py check-metadata maven
+
+          # Commit message from the added release.json files: "AmaniAi 3.23.2", "backfill AmaniAi 2.6.5", …
+          msg="$(git diff --cached --name-only --diff-filter=A -- maven | { grep '/release\.json$' || true; } \
+            | xargs -I{} python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); print(("backfill " if r.get("backfilled") is True else "") + r["artifactId"] + " " + r["version"])' {} \
+            | paste -sd ',' - | sed 's/,/, /g')"
+          [ -n "$msg" ] || msg="maven repository update"
+          git add -A maven
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit --quiet -m "chore(release): ${msg}" -m "Published from pull request #${PR_NUMBER}, approved by ${REVIEWER}."
+          before="$(git rev-parse HEAD^)"
+          git push --quiet origin HEAD:main
+          {
+            echo "published=true"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "before=${before}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Published ${msg} → $(git rev-parse --short HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Close the pull request
+        if: steps.apply.outputs.published == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SHA: ${{ steps.apply.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh pr comment "$PR_NUMBER" -R "$GITHUB_REPOSITORY" \
+            --body "Published to \`main\` in ${SHA} by the release bot. The GitHub Release is created next."
+          gh pr close "$PR_NUMBER" -R "$GITHUB_REPOSITORY" --delete-branch
+
+  release:
+    needs: publish
+    if: needs.publish.outputs.published == 'true'
+    permissions:
+      contents: write
+      pull-requests: read
+    uses: ./.github/workflows/release-maven.yml
+    with:
+      ref: ${{ needs.publish.outputs.sha }}
+      before: ${{ needs.publish.outputs.before }}
+      pr-number: ${{ format('{0}', github.event.pull_request.number) }}

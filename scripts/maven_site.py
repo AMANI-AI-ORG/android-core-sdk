@@ -235,64 +235,80 @@ def cmd_pending(args):
 
 
 # ── notes ────────────────────────────────────────────────────────────────────────────────────────
+# Same badges as the SDK release notes on the documentation site (androidv3/ReleaseNote.md).
 BADGES = {
-    "fix":         "https://img.shields.io/badge/fix-D73A49",
-    "feature":     "https://img.shields.io/badge/feature-2EA44F",
-    "improvement": "https://img.shields.io/badge/improvement-0366D6",
-    "update":      "https://img.shields.io/badge/update-6F42C1",
-    "change":      "https://img.shields.io/badge/change-E36209",
+    "feature":     "![Feature](https://img.shields.io/badge/Feature-✨-27ae60)",
+    "improvement": "![Improvement](https://img.shields.io/badge/Improvement-🛠️-8e44ad)",
+    "change":      "![Change](https://img.shields.io/badge/Change-♻️-136634)",
+    "fix":         "![Fix](https://img.shields.io/badge/Fix-🐛-e74c3c)",
 }
+ALIASES = {"features": "feature", "improvements": "improvement", "changes": "change",
+           "update": "change", "updates": "change", "fixes": "fix", "bugfix": "fix", "bug": "fix"}
+LEADING_IMAGE = re.compile(r"^!\[[^\]]*\]\([^)]*\)\s*")
+KEYWORD = re.compile(r"^([A-Za-z]+)\s*(?::|-|—|–)\s*|^([A-Za-z]+)\s+(?=\S)")
 
 
-def pr_release_items(body):
-    """Items under a '### Release notes' heading of a pull request body (until the next heading)."""
+def section_items(text, heading):
+    """List items under a '### <heading>' line (case-insensitive) up to the next heading or rule."""
     items, capture = [], False
-    for line in (body or "").splitlines():
+    for line in (text or "").splitlines():
         s = line.strip()
-        if s.lower().startswith("### release notes"):
+        if s.lower().startswith("### " + heading):
             capture = True
             continue
-        if capture and s.startswith("#"):
+        if capture and (s.startswith("#") or s == "---"):
             break
         if capture:
             s = s.lstrip("-*• ").strip()
-            if s and not s.startswith("<!--"):
+            if s and not s.startswith("<!--") and not s.startswith("-->"):
                 items.append(s)
     return items
 
 
+def pr_release_items(body):
+    """Items under a '### Release notes' heading of a pull request body (until the next heading)."""
+    return section_items(body, "release notes")
+
+
 def badge(item):
-    low = item.lower()
-    for kw, url in BADGES.items():
-        if low.startswith(kw) and not item.startswith("!["):
-            return f"![{kw}]({url}) {item}"
-    return item
+    """'fix: **NFC** — text' / 'Feature - text' / an item already carrying a badge image →
+    '<docs badge> **NFC** — text'. Items without a known keyword are kept as they are."""
+    text = LEADING_IMAGE.sub("", item.strip())
+    m = KEYWORD.match(text)
+    if m:
+        word = (m.group(1) or m.group(2)).lower()
+        word = ALIASES.get(word, word)
+        if word in BADGES:
+            rest = text[m.end():].strip()
+            return f"{BADGES[word]} {rest}" if rest else BADGES[word]
+    return text
 
 
 def cmd_notes(args):
-    """GitHub Release body for one version folder.
+    """GitHub Release body for one version folder: "What's Changed" first, checksums at the bottom.
 
-    When the merged pull request's body has a '### Release notes' section, its items (with badges)
-    replace the What's Changed part of RELEASE_NOTES.md; the checksum section always comes from
-    RELEASE_NOTES.md. Without that section RELEASE_NOTES.md is used as it is."""
+    Items come from the '### Release notes' section of the pull request that added the folder; when
+    it has none, from the "What's Changed" section of the folder's RELEASE_NOTES.md (written by the
+    SDK repository's release workflows). Every item gets the documentation-site badge of its leading
+    keyword (feature / improvement / change / fix). The checksum section always comes from
+    RELEASE_NOTES.md."""
     vdir = Path(args.version_dir)
     rel = load_release(vdir)
     text = (vdir / "RELEASE_NOTES.md").read_text()
     body = Path(args.pr_body_file).read_text() if args.pr_body_file else ""
-    items = pr_release_items(body)
-    if items:
-        idx = text.find("### Checksums (SHA-256)")
-        checksums = text[idx:] if idx >= 0 else ""
-        first = text.splitlines()[0] if text else ""
-        header = first if first.startswith("## ") else f"## {rel['artifactId']} {rel['version']}"
-        lines = [header, "", "### What's Changed"]
-        lines += [f"* {badge(i)}" for i in items]
-        text = "\n".join(lines) + "\n\n" + checksums
+    items = pr_release_items(body) or section_items(text, "what's changed")
+    idx = text.find("### Checksums (SHA-256)")
+    checksums = text[idx:].rstrip("\n") if idx >= 0 else ""
+    lines = ["## What's Changed", ""]
+    lines += [f"* {badge(i)}" for i in items] if items else ["* Maintenance release."]
+    lines += ["", "---", ""]
+    if checksums:
+        lines.append(checksums)
     maven_url = (args.maven_url or "").rstrip("/")
-    if maven_url and "Maven repository:" not in text:
-        text = text.rstrip("\n") + (f"\n\nMaven repository: `{maven_url}/` · coordinates "
-                                    f"`{rel['groupId']}:{rel['artifactId']}:{rel['version']}`\n")
-    sys.stdout.write(text)
+    if maven_url:
+        lines += ["", f"Maven repository: `{maven_url}/` · coordinates "
+                      f"`{rel['groupId']}:{rel['artifactId']}:{rel['version']}`"]
+    sys.stdout.write("\n".join(lines).rstrip("\n") + "\n")
     return 0
 
 

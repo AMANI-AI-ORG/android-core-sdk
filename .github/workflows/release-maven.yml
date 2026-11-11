@@ -1,6 +1,7 @@
 name: Release Maven versions
 
-# Runs when a release pull request is merged into main. The Maven repository is served straight from
+# Runs after the release bot commits a version folder to main (called by publish-on-approval.yml), or
+# when a version folder reaches main another way (push). The Maven repository is served straight from
 # this repository (raw.githubusercontent.com/<owner>/<repo>/main/maven), so there is nothing to deploy:
 # this workflow re-checks every version folder and maven-metadata.xml, checks that the raw URL serves
 # exactly the bytes in SHA256SUMS, then creates the GitHub Release for every new version (backfilled
@@ -13,11 +14,29 @@ name: Release Maven versions
 # https://raw.githubusercontent.com/<this repository>/main/maven is used.
 
 on:
+  # A manual merge of a version folder (normally the bot publishes them, see publish-on-approval.yml).
   push:
     branches: [main]
     paths:
       - 'maven/**'
   workflow_dispatch:
+  # Called by publish-on-approval.yml right after the bot commit (a push made with GITHUB_TOKEN does
+  # not start other workflows).
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit on main to release (the bot commit)
+        type: string
+        required: true
+      before:
+        description: main before that commit (folders added in between are the new ones)
+        type: string
+        required: true
+      pr-number:
+        description: Pull request whose "### Release notes" section is used
+        type: string
+        required: false
+        default: ''
 
 concurrency:
   group: release-maven
@@ -35,6 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref || github.sha }}
           # Full history: the commit that added a version folder leads to its pull request.
           fetch-depth: 0
 
@@ -48,7 +68,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MAVEN_URL: ${{ vars.PUBLIC_MAVEN_URL }}
-          BEFORE: ${{ github.event.before }}
+          BEFORE: ${{ inputs.before || github.event.before }}
+          TARGET: ${{ inputs.ref || github.sha }}
+          PR_NUMBER: ${{ inputs.pr-number }}
         run: |
           set -euo pipefail
           BASE="${MAVEN_URL:-https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/maven}"; BASE="${BASE%/}"
@@ -57,7 +79,7 @@ jobs:
           # Folders added by this push (all of them on a manual run): backfilled versions have no
           # release to mark them done, so only the newly added ones are downloaded and checked.
           if [ -n "${BEFORE:-}" ] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
-            git diff --name-only --diff-filter=A "$BEFORE" "$GITHUB_SHA" -- maven \
+            git diff --name-only --diff-filter=A "$BEFORE" "$TARGET" -- maven \
               | sed -n 's#/release\.json$##p' > "$RUNNER_TEMP/new-dirs.txt"
           else
             python3 -I scripts/maven_site.py pending maven | jq -r .dir > "$RUNNER_TEMP/new-dirs.txt"
@@ -100,7 +122,11 @@ jobs:
             # this folder (badges for fix/feature/improvement/update/change), else RELEASE_NOTES.md.
             : > "$RUNNER_TEMP/pr-body.md"
             added="$(git log --diff-filter=A --format=%H -1 -- "$dir/release.json")"
-            if [ -n "$added" ]; then
+            if [ -n "${PR_NUMBER:-}" ] && grep -qxF "$dir" "$RUNNER_TEMP/new-dirs.txt"; then
+              # Bot commit: not linked to the PR by GitHub, so the PR number comes from the caller.
+              gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.body // ""' > "$RUNNER_TEMP/pr-body.md" 2>/dev/null \
+                || { echo "::warning::Could not read PR #${PR_NUMBER} — using RELEASE_NOTES.md"; : > "$RUNNER_TEMP/pr-body.md"; }
+            elif [ -n "$added" ]; then
               gh api "repos/${GITHUB_REPOSITORY}/commits/${added}/pulls" \
                 --jq '[.[] | select(.merged_at != null)][0].body // ""' \
                 > "$RUNNER_TEMP/pr-body.md" 2>/dev/null \
@@ -110,7 +136,7 @@ jobs:
               --maven-url "$BASE" > "$RUNNER_TEMP/notes.md"
             # No --latest for stable versions: GitHub then keeps the highest version as Latest, so a
             # hotfix on an older line does not take it over.
-            flags=(--target "$GITHUB_SHA" --title "$tag" --notes-file "$RUNNER_TEMP/notes.md")
+            flags=(--target "$TARGET" --title "$tag" --notes-file "$RUNNER_TEMP/notes.md")
             if [ "$pre" = "true" ]; then flags+=(--prerelease --latest=false); fi
             gh release create "$tag" "${files[@]}" "${flags[@]}"
             echo "Released $tag — $url" >> "$GITHUB_STEP_SUMMARY"

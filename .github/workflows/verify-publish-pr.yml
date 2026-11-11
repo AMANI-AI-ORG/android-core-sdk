@@ -16,6 +16,8 @@ on:
   pull_request_target:
     branches: [main]
     types: [opened, synchronize, reopened, edited]
+  # Re-run by publish-on-approval.yml on the approved head before the bot publishes it.
+  workflow_call:
 
 permissions:
   contents: read
@@ -28,6 +30,8 @@ jobs:
       # Base (main) — provides the trusted scripts/maven_site.py.
       - uses: actions/checkout@v4
         with:
+          # The PR's base commit, whatever the triggering event (pull_request_target or a review).
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
           persist-credentials: false
 
