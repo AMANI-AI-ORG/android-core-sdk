@@ -10,6 +10,7 @@ name: Publish approved release PR
 #                 bot commit, notes from the PR's "### Release notes").
 #
 # Pull requests that change anything outside maven/ are left alone (merge them normally).
+# Only reviewers with write access count (anyone can leave an "approved" review on a public repo).
 # Requirement: the main ruleset must let GitHub Actions push to main (bypass list). Then everyone who
 # can push a branch here can, through a workflow, write to main — keep write access to maintainers.
 
@@ -51,14 +52,27 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Approval is for the latest commit, by someone else
+      - name: Approval is by a maintainer, for the latest commit, by someone else
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REVIEW_SHA: ${{ github.event.review.commit_id }}
           REVIEWER: ${{ github.event.review.user.login }}
+          ASSOCIATION: ${{ github.event.review.author_association }}
         run: |
           set -euo pipefail
+          # On a public repository ANY GitHub user can submit an "approved" review. Only a reviewer
+          # with write access to this repository may publish (fails closed if it cannot be read).
+          case "$ASSOCIATION" in
+            OWNER|MEMBER|COLLABORATOR) ;;
+            *) echo "::error::${REVIEWER} (${ASSOCIATION}) is not a maintainer of this repository — approval ignored."; exit 1 ;;
+          esac
+          perm="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${REVIEWER}/permission" --jq .permission)" \
+            || { echo "::error::Could not read ${REVIEWER}'s permission — approval ignored."; exit 1; }
+          case "$perm" in
+            admin|maintain|write) ;;
+            *) echo "::error::${REVIEWER} has '${perm}' access — write access is needed to publish."; exit 1 ;;
+          esac
           read -r state head author < <(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"\(.state) \(.head.sha) \(.user.login)"')
           [ "$state" = "open" ] || { echo "::error::PR #${PR_NUMBER} is ${state}."; exit 1; }
           [ "$head" = "$REVIEW_SHA" ] || { echo "::error::The approval is for ${REVIEW_SHA}, the PR head is ${head}. Approve the latest commit."; exit 1; }
