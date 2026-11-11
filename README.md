@@ -8,6 +8,37 @@ Add the Amani Maven repository to `settings.gradle`:
 
 ```groovy
 dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        mavenCentral()
+        maven {
+            url = "https://jfrog.amani.ai/artifactory/amani-sdk"
+        }
+    }
+}
+```
+
+Kotlin DSL (`settings.gradle.kts`):
+
+```kotlin
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        mavenCentral()
+        maven {
+            url = uri("https://jfrog.amani.ai/artifactory/amani-sdk")
+        }
+    }
+}
+```
+
+### Alternative repository (GitHub)
+
+If the SDK cannot be resolved from the repository above, use the Maven repository in this GitHub
+repository instead (or in addition):
+
+```groovy
+dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
@@ -58,7 +89,7 @@ Available versions are listed in
 
 ## Verifying the SDK
 
-Each version folder in the repository contains a `SHA256SUMS` file with the SHA-256 of every file of
+Each version folder in this GitHub repository contains a `SHA256SUMS` file with the SHA-256 of every file of
 that version.
 
 **A downloaded AAR**
