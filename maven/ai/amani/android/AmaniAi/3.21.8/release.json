@@ -6,17 +6,5 @@
   "prerelease": false,
   "backfilled": true,
   "sourceTag": "v3.21.8",
-  "sourceCommit": "c3c17226c17e69b82e7e163bd76c908563df6dcd",
-  "obfuscation": {
-    "minifyEnabled": "true",
-    "renamedClasses": 228,
-    "totalClasses": 1078
-  },
-  "appConstantsVersion": {
-    "source": "Core SDK: 3.21.0",
-    "built": "Core SDK: 3.21.8",
-    "corrected": true,
-    "inAar": "found"
-  },
   "createdAt": "2026-11-11T12:44:38Z"
 }

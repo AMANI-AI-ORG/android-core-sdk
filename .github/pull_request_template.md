@@ -9,6 +9,9 @@ the documentation site, e.g.
 - feature: **Optional Steps** — Step results now tell whether a step is optional.
 - fix: Internal minor improvements & fixes.
 Leave the section empty to publish the release with "Maintenance release.".
+This repository is public: no source commits, obfuscation/R8 figures, mapping files, local paths
+or e-mails in the notes or files. "Verify publish PR" rejects release.json keys outside the
+allowlist and such terms in RELEASE_NOTES.md.
 -->
 
 ### Release notes
