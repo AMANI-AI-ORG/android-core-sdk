@@ -1,0 +1,22 @@
+{
+  "groupId": "ai.amani.android",
+  "artifactId": "AmaniAi",
+  "version": "3.22.1",
+  "tag": "v3.22.1",
+  "prerelease": false,
+  "backfilled": true,
+  "sourceTag": "v3.22.1",
+  "sourceCommit": "6b54ad615633adbf72b014b8e65ff98035cb2074",
+  "obfuscation": {
+    "minifyEnabled": "true",
+    "renamedClasses": 253,
+    "totalClasses": 1114
+  },
+  "appConstantsVersion": {
+    "source": "Core SDK: 3.21.0",
+    "built": "Core SDK: 3.22.1",
+    "corrected": true,
+    "inAar": "found"
+  },
+  "createdAt": "2026-11-11T12:42:52Z"
+}

@@ -1,0 +1,22 @@
+{
+  "groupId": "ai.amani.android",
+  "artifactId": "AmaniAi",
+  "version": "3.11.4",
+  "tag": "v3.11.4",
+  "prerelease": false,
+  "backfilled": true,
+  "sourceTag": "3.11.4",
+  "sourceCommit": "215271e4b1e260021f9e31166b00b5a93d8d3f05",
+  "obfuscation": {
+    "minifyEnabled": "true",
+    "renamedClasses": 211,
+    "totalClasses": 1031
+  },
+  "appConstantsVersion": {
+    "source": "3.11.4",
+    "built": "3.11.4",
+    "corrected": false,
+    "inAar": "found"
+  },
+  "createdAt": "2026-11-11T12:46:27Z"
+}
