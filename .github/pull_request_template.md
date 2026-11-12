@@ -1,8 +1,9 @@
 <!--
-Release pull request: one version folder under maven/ (plus the regenerated maven-metadata.xml).
-Do NOT merge it. When a maintainer approves it (and "Verify publish PR" is green), the release bot
-commits the files to main as github-actions[bot] ("chore(release): …"), closes this PR and creates
-the GitHub Release with the notes below; the checksums are added at the bottom automatically.
+Release pull request: one version folder under maven/ (plus the regenerated maven-metadata.xml),
+opened by github-actions[bot] (or the SDK repository's publishing App). Do NOT merge it by hand (a
+hand merge gets no tag or release). Approve it: the approval runs "Verify publish PR" (editing this
+description runs it too), then merges this PR, tags its commit and creates the GitHub Release with
+the notes below; the checksums are added at the bottom automatically. A failed check merges nothing.
 
 One item per line. Start an item with feature / improvement / change / fix to get the same badge as
 the documentation site, e.g.

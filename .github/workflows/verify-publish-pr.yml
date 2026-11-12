@@ -3,9 +3,12 @@ name: Verify publish PR
 # Required status check on main. A pull request may only ADD new version folders under maven/ (plus
 # the regenerated maven-metadata.xml next to them): no published file is ever changed or deleted. Every added folder must contain only its artifacts,
 # their checksum files, SHA256SUMS, RELEASE_NOTES.md and release.json, all consistent with the bytes;
-# its tag must not exist yet; and the pull request — every commit in it — must come from the
-# publishing GitHub App (repository variable PUBLISHER_BOT, e.g. amani-sdk-publisher[bot]) or, for an
-# emergency manual publish PR, from one maintainer listed in repository variable LOCAL_PUBLISHERS.
+# its tag must not exist yet; the branch must say what the pull request is (release/<version>: exactly
+# that one new version; release/backfill-…: only backfilled versions); and the pull request must come
+# from this repository, opened by github-actions[bot] (open-release-pr.yml, for a branch a maintainer
+# listed in LOCAL_PUBLISHERS pushed) or by the SDK repository's publishing App (repository variable
+# PUBLISHER_BOT, optional) — with every commit by that bot or by such a maintainer. A pull request opened by a listed maintainer themself (older flow) is still accepted
+# when every commit is theirs; they then cannot approve it.
 #
 # pull_request_target on purpose: the workflow and scripts/maven_site.py run from main, so a pull
 # request cannot weaken its own check by editing them. The pull request's files are only READ (git
@@ -16,7 +19,7 @@ on:
   pull_request_target:
     branches: [main]
     types: [opened, synchronize, reopened, edited]
-  # Re-run by publish-on-approval.yml on the approved head before the bot publishes it.
+  # Re-run by publish-on-approval.yml on the approved head before it merges the pull request.
   workflow_call:
 
 permissions:
@@ -86,51 +89,54 @@ jobs:
           printf '%s\n' "${dirs[@]:-}" | sort -u | sed '/^$/d' > "$RUNNER_TEMP/dirs.txt"
           echo "Added version folders:"; cat "$RUNNER_TEMP/dirs.txt" || true
 
-      # Two allowed publishers:
-      #   - PUBLISHER_BOT: the GitHub App used by the SDK repository's release workflows (normal path).
-      #   - LOCAL_PUBLISHERS: SDK maintainers' GitHub logins (space or comma separated) allowed to
-      #     open an EMERGENCY pull request built on their own machine with /amani-manual-publish-pr when
-      #     GitHub Actions cannot be used. Leave it empty to allow the App only.
-      # Either way every commit in the pull request must be authored AND committed by the PR author
-      # (GitHub resolves the login from the commit e-mail, so it must be linked to that account).
+      # Allowed publishers:
+      #   - github-actions[bot]: open-release-pr.yml opens the PR (GITHUB_TOKEN) for a branch a
+      #     maintainer pushed (that maintainer's commits).
+      #   - PUBLISHER_BOT (optional): the SDK repository's publishing App, which opens its own PR with
+      #     its own commits.
+      #   - LOCAL_PUBLISHERS: SDK maintainers' GitHub logins (space or comma separated) whose commits
+      #     (/amani-manual-publish-pr, /amani-backfill-versions) may be published. Empty = App only.
+      # Every commit must be authored AND committed by the same allowed login (GitHub resolves the
+      # login from the commit e-mail, so it must be linked to that account).
       - name: Version folders come from an allowed publisher only
         env:
           GH_TOKEN: ${{ github.token }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           PUBLISHER_BOT: ${{ vars.PUBLISHER_BOT }}
           LOCAL_PUBLISHERS: ${{ vars.LOCAL_PUBLISHERS }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           [ -s "$RUNNER_TEMP/dirs.txt" ] || exit 0
-          if [ -z "$PUBLISHER_BOT" ]; then
-            echo "::error::Repository variable PUBLISHER_BOT is not set (the publishing App's bot login, e.g. amani-sdk-publisher[bot])."
+          if [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
+            echo "::error::Version folders may only come from a branch of this repository (this pull request is from ${HEAD_REPO:-a fork})."
             exit 1
           fi
-          allowed=0
-          if [ "$AUTHOR" = "$PUBLISHER_BOT" ]; then
-            allowed=1
+          IFS=', ' read -r -a logins <<< "$LOCAL_PUBLISHERS"
+          listed() { local l; for l in "${logins[@]:-}"; do [ -n "$l" ] && [ "$l" = "$1" ] && return 0; done; return 1; }
+          if [ "$AUTHOR" = "github-actions[bot]" ] || { [ -n "$PUBLISHER_BOT" ] && [ "$AUTHOR" = "$PUBLISHER_BOT" ]; }; then
+            allowed=("$AUTHOR" "${logins[@]:-}")
+          elif listed "$AUTHOR"; then
+            echo "::notice::Pull request opened by maintainer $AUTHOR (listed in LOCAL_PUBLISHERS) — they cannot approve it themselves."
+            allowed=("$AUTHOR")
           else
-            IFS=', ' read -r -a logins <<< "$LOCAL_PUBLISHERS"
-            for login in "${logins[@]:-}"; do
-              if [ "$login" = "$AUTHOR" ]; then
-                allowed=1
-                echo "::notice::Emergency manual publish PR by maintainer $AUTHOR (listed in LOCAL_PUBLISHERS)."
-              fi
-            done
-          fi
-          if [ "$allowed" != 1 ]; then
-            echo "::error::Version folders under maven/ may only be added by $PUBLISHER_BOT or a login in LOCAL_PUBLISHERS (this pull request is from $AUTHOR). Publish through the release workflow in the SDK repository."
+            echo "::error::Version folders under maven/ may only be added by github-actions[bot]${PUBLISHER_BOT:+, $PUBLISHER_BOT} or a login in LOCAL_PUBLISHERS (this pull request is from $AUTHOR). Publish through the release workflow in the SDK repository."
             exit 1
           fi
           # Every commit, not just the PR author: a commit pushed on top of the branch by anyone
           # else (even with consistent checksums) is rejected.
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" --paginate \
             --jq '.[] | "\(.sha) \(.author.login // "-") \(.committer.login // "-")"' > "$RUNNER_TEMP/commits.txt"
-          others="$(awk -v who="$AUTHOR" '$2 != who || $3 != who' "$RUNNER_TEMP/commits.txt")"
+          others=""
+          while read -r sha a c; do
+            ok=0
+            for l in "${allowed[@]}"; do [ -n "$l" ] && [ "$a" = "$l" ] && [ "$c" = "$l" ] && ok=1; done
+            [ "$ok" = 1 ] || others="${others}${sha} ${a} ${c}"$'\n'
+          done < "$RUNNER_TEMP/commits.txt"
           if [ -n "$others" ]; then
-            echo "::error::Commits not authored and committed by $AUTHOR (a commit e-mail not linked to a GitHub account shows as '-'):"
-            echo "$others"
+            echo "::error::Commits not authored and committed by an allowed publisher (${allowed[*]}) — a commit e-mail not linked to a GitHub account shows as '-':"
+            printf '%s' "$others"
             exit 1
           fi
 
@@ -151,6 +157,40 @@ jobs:
           # the version folders of the PR head (trusted script from main, PR files as data).
           cd "$RUNNER_TEMP/pr"
           python3 -I "$GITHUB_WORKSPACE/scripts/maven_site.py" check-metadata maven
+
+      # The branch name is the release type: release/<version> publishes exactly that one new version
+      # (tag + GitHub Release after approval); release/backfill-… adds only backfilled old versions
+      # (no tag, no release). Anything else must not add version folders.
+      - name: Branch name matches the release type
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          [ -s "$RUNNER_TEMP/dirs.txt" ] || exit 0
+          python3 -I - "$HEAD_REF" "$RUNNER_TEMP/pr" "$RUNNER_TEMP/dirs.txt" <<'PY'
+          import json, os, re, sys
+          ref, root, dirs = sys.argv[1], sys.argv[2], [l.strip() for l in open(sys.argv[3]) if l.strip()]
+          rels = {d: json.load(open(os.path.join(root, d, "release.json"))) for d in dirs}
+          def fail(msg):
+              print(f"::error::{msg}"); sys.exit(1)
+          if ref.startswith("release/backfill-"):
+              bad = [d for d, r in rels.items() if r.get("backfilled") is not True]
+              if bad:
+                  fail(f"{ref} is a backfill branch, but {', '.join(bad)} is not marked backfilled — a new version goes on release/<version>.")
+              print(f"Backfill of {', '.join(r['version'] for r in rels.values())}: no tag, no release.")
+          elif re.fullmatch(r"release/[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9._-]*", ref):
+              want = ref[len("release/"):]
+              if len(rels) != 1:
+                  fail(f"{ref} must add exactly one version folder (it adds {len(rels)}).")
+              (d, r), = rels.items()
+              if r.get("backfilled") is True:
+                  fail(f"{d} is backfilled — backfills go on a release/backfill-… branch.")
+              if r.get("version") != want:
+                  fail(f"{ref} adds version {r.get('version')} — the branch and the version must match.")
+              print(f"New version {want}: tag and GitHub Release after approval.")
+          else:
+              fail(f"Version folders may only be added from release/<version> or release/backfill-… (this branch is {ref}).")
+          PY
 
       - name: Tags must not exist yet
         env:
